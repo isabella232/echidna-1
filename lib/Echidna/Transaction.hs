@@ -3,6 +3,7 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE ViewPatterns #-}
 
 module Echidna.Transaction where
@@ -76,7 +77,7 @@ getSignatures hmm (Just lmm) = usuallyRarely hmm lmm -- once in a while, this wi
 genTx :: forall m x y. (MonadRandom m, MonadReader x m, Has TxConf x, MonadState y m, Has World y, MonadThrow m)
       => Map Addr Contract
       -> m Tx
-genTx m = use (hasLens :: Lens' y World) >>= evalStateT (genTxM m) . (defaultDict,)
+genTx m = use (hasLens @World) >>= evalStateT (genTxM m) . (defaultDict,)
 
 -- | Generate a random 'Transaction' with either synthesis or mutation of dictionary entries.
 genTxM :: (MonadRandom m, MonadReader x m, Has TxConf x, MonadState y m, Has GenDict y, Has World y, MonadThrow m)
