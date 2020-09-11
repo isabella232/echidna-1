@@ -3,6 +3,7 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE NoMonomorphismRestriction #-}
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -69,8 +70,8 @@ isDone (view tests -> ts) = do
 -- | Given a 'Campaign', check if the test results should be reported as a
 -- success or a failure.
 isSuccess :: Campaign -> Bool
-isSuccess (view tests -> ts) =
-  all (\case { Passed -> True; Open _ -> True; _ -> False; }) $ snd <$> ts
+isSuccess (toListOf (tests . traverse . _2) -> ts) =
+  all (\case { Passed -> True; Open _ -> True; _ -> False; }) ts
 
 -- | Given an initial 'VM' state and a @('SolTest', 'TestState')@ pair, as well as possibly a sequence
 -- of transactions and the state after evaluation, see if:
@@ -101,17 +102,18 @@ updateTest v Nothing (n, t) = do
 -- | Given a rule for updating a particular test's state, apply it to each test in a 'Campaign'.
 runUpdate :: (MonadReader x m, Has TxConf x, MonadState y m, Has Campaign y)
           => ((SolTest, TestState) -> m (SolTest, TestState)) -> m ()
-runUpdate f = use (hasLens . tests) >>= mapM f >>= (hasLens . tests .=)
+runUpdate f = let l = hasLens . tests in use l >>= mapM f >>= (l .=)
 
 -- | Given an initial 'VM' state and a way to run transactions, evaluate a list of transactions, constantly
 -- checking if we've solved any tests or can shrink known solves.
 evalSeq :: ( MonadCatch m, MonadRandom m, MonadReader x m, MonadState y m
-           , Has SolConf x, Has TestConf x, Has TxConf x, Has CampaignConf x, Has Campaign y, Has VM y)
+           , Has SolConf x, Has TestConf x, Has TxConf x, Has CampaignConf x
+           , Has Campaign y, Has VM y)
         => VM -> (Tx -> m a) -> [Tx] -> m [(Tx, a)]
 evalSeq v e = go [] where
   go r xs = do
     v' <- use hasLens
-    runUpdate (updateTest v $ Just (v',reverse r))
+    runUpdate (updateTest v $ Just (v', reverse r))
     case xs of []     -> pure []
                (y:ys) -> e y >>= \a -> ((y, a) :) <$> go (y:r) ys
 
@@ -121,10 +123,12 @@ shrinkGasSeq :: ( MonadRandom m, MonadReader x m, MonadThrow m
                 , Has SolConf x, Has TestConf x, Has TxConf x, MonadState y m, Has VM y)
           => Text -> Int -> [Tx] -> m [Tx]
 shrinkGasSeq f g xs = sequence [shorten, shrunk] >>= uniform >>= ap (fmap . flip bool xs) check where
-  callsF f' (Tx(SolCall(f'', _)) _ _ _ _ _ _) = f' == f''
-  callsF _ _                                  = False
-  check xs' | callsF f $ last xs' = do {_ <- get; res <- traverse execTx xs'; pure ((snd . head) res >= g) }
-  check _                         = pure False
+  callsF f' t = t ^? call . _SolCall . _1 == Just f'
+  check xs' | callsF f $ last xs' = do
+    _ <- get -- TODO: why are we discarding this get?
+    res <- traverse execTx xs'
+    pure $ (snd . head) res >= g
+  check _ = pure False
   shrinkSender x = do
     l <- view (hasLens . sender)
     case ifind (const (== x ^. src)) l of
@@ -137,27 +141,30 @@ shrinkGasSeq f g xs = sequence [shorten, shrunk] >>= uniform >>= ap (fmap . flip
 -- gas usage for each call
 updateGasInfo :: [(Tx, (VMResult, Int))] -> [Tx] -> Map Text (Int, [Tx]) -> Map Text (Int, [Tx])
 updateGasInfo [] _ gi = gi
-updateGasInfo ((t@(Tx (SolCall(f, _)) _ _ _ _ _ _), (_, used')):ts) tseq gi =
-  let mused = Data.Map.lookup f gi
-      tseq' = t:tseq
-  in  case mused of Nothing -> updateGasInfo ts tseq' (insert f (used', reverse tseq') gi)
-                    Just (used, _) | used' > used -> updateGasInfo ts tseq' (insert f (used', reverse tseq') gi)
-                    Just (used, otseq) | (used' == used) && (length otseq > length tseq') -> updateGasInfo ts tseq' (insert f (used', reverse tseq') gi)
-                    _ -> updateGasInfo ts tseq' gi
+updateGasInfo ((t@(Tx (SolCall (f, _)) _ _ _ _ _ _), (_, used')):ts) tseq gi =
+  case mused of
+    Nothing -> rec
+    Just (used, _) | used' > used -> rec
+    Just (used, otseq) | (used' == used) && (length otseq > length tseq') -> rec
+    _ -> updateGasInfo ts tseq' gi
+  where mused = Data.Map.lookup f gi
+        tseq' = t:tseq
+        rec   = updateGasInfo ts tseq' (insert f (used', reverse tseq') gi)
 updateGasInfo ((t, _):ts) tseq gi = updateGasInfo ts (t:tseq) gi
 
 -- | Execute a transaction, capturing the PC and codehash of each instruction executed, saving the
 -- transaction if it finds new coverage.
 execTxOptC :: (MonadState x m, Has Campaign x, Has VM x, MonadThrow m) => Tx -> m (VMResult, Int)
 execTxOptC t = do
-  og  <- hasLens . coverage <<.= mempty
-  res <- execTxWith vmExcept (usingCoverage $ pointCoverage (hasLens . coverage)) t
+  let l = hasLens . coverage
+  og  <- l <<.= mempty
+  res <- execTxWith vmExcept (usingCoverage $ pointCoverage l) t
   let vmr = getResult $ fst res
   -- Update the coverage map with the proper binary according to the vm result
-  hasLens . coverage %= mapWithKey (\ _ s -> DS.map (\(i,_) -> (i, vmr)) s)
+  l %= mapWithKey (\ _ s -> DS.map (\(i,_) -> (i, vmr)) s)
   -- Update the global coverage map with the union of the result just obtained
-  hasLens . coverage %= unionWith DS.union og
-  grew <- (== LT) . comparing coveragePoints og <$> use (hasLens . coverage)
+  l %= unionWith DS.union og
+  grew <- (== LT) . comparing coveragePoints og <$> use l
   when grew $ do
     hasLens . genDict %= gaddCalls ([t ^. call] ^.. traverse . _SolCall)
     hasLens . newCoverage .= True
@@ -169,10 +176,11 @@ addToCorpus n res = unless (null rtxs) $ hasLens . corpus %= DS.insert (toIntege
   where rtxs = fst <$> res
 
 seqMutators :: (MonadRandom m) => MutationConsts -> m (Int -> Corpus -> [Tx] -> m [Tx])
-seqMutators (c1, c2, c3) = fromList
-                            [(cnm      , fromInteger c1),
-                             (mut False, fromInteger c2),
-                             (mut True , fromInteger c3)]
+seqMutators (c1, c2, c3) =
+  fromList [ (cnm      , fromInteger c1)
+           , (mut False, fromInteger c2)
+           , (mut True , fromInteger c3)
+           ]
   -- Use the generated random transactions
   where cnm _ _          = return
         mut flp ql ctxs gtxs = do
@@ -193,16 +201,15 @@ randseq ql o w = do
   let ctxs = ca ^. corpus
       p    = ca ^. ncallseqs
   if length ctxs > p then -- Replay the transactions in the corpus, if we are executing the first iterations
-    return $ snd $ DS.elemAt p ctxs
-  else
-    do
-      -- Randomly generate new random transactions
-      gtxs <- replicateM ql (evalStateT (genTxM o) (w, ca ^. genDict))
-      -- Select a random mutator
-      mut <- seqMutators cs
-      if DS.null ctxs
-      then return gtxs      -- Use the generated random transactions
-      else mut ql ctxs gtxs -- Apply the mutator
+    return . snd $ DS.elemAt p ctxs
+  else do
+    -- Randomly generate new random transactions
+    gtxs <- replicateM ql (evalStateT (genTxM o) (w, ca ^. genDict))
+    -- Select a random mutator
+    mut <- seqMutators cs
+    if DS.null ctxs
+    then return gtxs      -- Use the generated random transactions
+    else mut ql ctxs gtxs -- Apply the mutator
 
 -- | Given an initial 'VM' and 'World' state and a number of calls to generate, generate that many calls,
 -- constantly checking if we've solved any tests or can shrink known solves. Update coverage as a result
