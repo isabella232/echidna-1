@@ -28,7 +28,7 @@ import System.Directory           (findExecutable)
 import Echidna.ABI                (encodeSig, hashSig, fallback, commonTypeSizes, mkValidAbiInt, mkValidAbiUInt)
 import Echidna.Exec               (execTx, initialVM)
 import Echidna.RPC                (loadEthenoBatch)
-import Echidna.Types.Signature    (FunctionHash, SolSignature, SignatureMap)
+import Echidna.Types.Signature    (ContractName, FunctionHash, SolSignature, SignatureMap)
 import Echidna.Types.Tx           (TxConf, TxCall(..), Tx(..), unlimitedGasPerBlock, initialTimestamp, initialBlockNumber)
 import Echidna.Types.World        (World(..))
 import Echidna.Processor
@@ -256,18 +256,28 @@ loadWithCryticCompile fp name = contracts fp >>= loadSpecified name
 -- for running a 'Campaign' against the tests found.
 prepareForTest :: (MonadReader x m, Has SolConf x)
                => (VM, NE.NonEmpty SolSignature, [Text], SignatureMap)
-               -> Maybe String
-               -> [SlitherInfo]
+               -> Maybe ContractName
+               -> SlitherInfo
                -> m (VM, World, [SolTest])
 prepareForTest (v, a, ts, m) c si = do
   SolConf{ _sender = s, _checkAsserts = ch } <- view hasLens
   let r = v ^. state . contract
       a' = NE.toList a
-      ps = filterResults c $ filterPayable si
-      as = if ch then filterResults c $ filterAssert si else []
-      cs = filterResults c $ filterConstantFunction si
+      ps = filterResults c $ payableFunctions si
+      as = if ch then filterResults c $ asserts si else []
+      cs = filterResults c $ constantFunctions si
       (hm, lm) = prepareHashMaps cs as m
   pure (v, World s hm lm ps, fmap Left (zip ts $ repeat r) ++ if ch then Right <$> drop 1 a' else [])
+
+-- this limited variant is used only in tests
+prepareForTest' :: (MonadReader x m, Has SolConf x)
+               => (VM, NE.NonEmpty SolSignature, [Text], SignatureMap)
+               -> m (VM, World, [SolTest])
+prepareForTest' (v, a, ts, _) = do
+  SolConf{ _sender = s, _checkAsserts = ch } <- view hasLens
+  let r = v ^. state . contract
+      a' = NE.toList a
+  pure (v, World s M.empty Nothing [], fmap Left (zip ts $ repeat r) ++ if ch then Right <$> drop 1 a' else [])
 
 prepareHashMaps :: [FunctionHash] -> [FunctionHash] -> SignatureMap -> (SignatureMap, Maybe SignatureMap)
 prepareHashMaps [] _  m = (m, Nothing)                                -- No constant functions detected
@@ -283,7 +293,7 @@ prepareHashMaps cs as m =
 -- a testing function.
 loadSolTests :: (MonadIO m, MonadThrow m, MonadReader x m, Has SolConf x, Has TxConf x, MonadFail m)
              => NE.NonEmpty FilePath -> Maybe Text -> m (VM, World, [SolTest])
-loadSolTests fp name = loadWithCryticCompile fp name >>= (\t -> prepareForTest t Nothing [])
+loadSolTests fp name = loadWithCryticCompile fp name >>= prepareForTest'
 
 mkLargeAbiInt :: Int -> AbiValue
 mkLargeAbiInt i = AbiInt i $ 2 ^ (i - 1) - 1
